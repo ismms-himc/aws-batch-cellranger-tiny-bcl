@@ -7,6 +7,10 @@ This document proposes schemas and vocabulary to be used across:
 
 Below are schemas and example data for various spreadsheets used by all parties, and [a glossary](#glossary) of relevant terms. This document heavily references the [10x documentation](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/using/mkfastq) as well.
 
+## TODO
+* look into [Multi-Library Sample workflow](https://support.10xgenomics.com/single-cell-vdj/software/pipelines/latest/advanced/multi-library-samples)
+* look into potential [index hopping issues](https://community.10xgenomics.com/t5/10x-Idea-Exchange/Index-hopping-is-a-serious-problem-whose-effects-can-be/idi-p/68421)
+
 ## Examples from 10x Documentation
 Below are two experimental scenarios from 10x that have been paraphrased into our vocabulary (see [Glossary]). 
 
@@ -152,6 +156,8 @@ A `Processing-Run` takes as input two spreadsheets and one or more BCLs. These t
 
 This CSV is similar to the simple CSV sample sheet passed to `mkfastq`, but includes additional information required to perform multiple jobs within a Processing Run (e.g. multiple `mkfastq` and `count` jobs). This CSV will be used to construct both [the sample sheet CSV inputs for multiple `mkfastq` runs][10X Sample Sheet CSV] and [the library CSVs for multiple `count` runs][10X Libraries CSV]. The `Reference Transcriptome` and `Number of Cells` columns will be used to construct additional arguments for `cellranger count`. Additionally, the `Index Name` value will be used for GEX libraries, while the `Index Oligo` value will be used for Custom libraries (ADT/HTO).
 
+**Note:** for all rows in the `HIMC Feature Reference CSV` file, the value for the column `feature_type` can be set to `Custom` only. It is not necessary that any other row exists with the value `Antibody Capture` or `Gene Expression` in this column.
+
 ### 2. HIMC Feature Reference CSV 
 
 | Library Features | id | name | read | pattern | sequence | feature_type | 
@@ -237,6 +243,31 @@ Sample names must conform to the Illumina `bcl2fastq` naming requirements. Only 
  
 This is the "simple samplesheet" format consumed by `cellranger mkfastq` (see 10x docs).
 
+### Index sequence collision
+If two or more index sequences are too close to each other (e.g., the distance is 2 or less bases), `cellranger mkfastq` calls an index sequence collision and exits with an error. The error message returned by `cellranger mkfastq` is written below:
+
+```
+The sample sheet supplied has a sample index collision. This can happen if the
+same sample index and lane were specified for multiple samples, or in certain
+cases where 10x Chromium i7 Multiplex Kit and i7 Multiplex Kit N samples were
+run on the same flowcell. It is a known issue that certain sample index
+combinations from these two different kits only differ by two bases-- meaning
+that it is possible for the sequencer to generate index reads with sequences
+that are one base away from multiple sample indices.
+Please check your samplesheet to verify you do not have duplicate lane-sample
+index pairs for multiple samples. If there are no duplicates, please run
+mkfastq with a --barcode-mismatches=0 argument. (The default parameter is
+--barcode-mismatches=1). This will make bcl2fastq only accept reads that
+match the sample indices exactly. The small percentage of reads that are a
+single base away from multiple sample indices will be ignored.
+```
+
+There are two ways to solve this collision. One is to set the parameter `--barcode-mismatches` to 0 (`--barcode-mismatches=0`). This is a `bcl2fastq` parameter, so it is not documented on the 10x Cellranger documentation; however, this parameter can be passed to `cellranger mkfastq`. For more information, please refer to the [`bcl2fastq`](https://support.illumina.com/content/dam/illumina-support/documents/documentation/software_documentation/bcl2fastq/bcl2fastq2-v2-20-software-guide-15051736-03.pdf) documentation. The second way is to run `cellranger mkfastq` separately for each sequencing library (potentially in a different container), even though they are all in the same BCL file. This way, each execution of `cellranger mkfastq` generates the Seq-Run-FASTQ Set for a single sequencing library and is unaware of the rest of sequencing libraries, so that index sequence collisions are not called.
+
+### Multiple `cellranger mkfastq` processes writing on the same directory  
+
+Occasionally, multiple `cellranger mkfastq` processes running on the same machine can attempt to write on the same directory. These processes can be spawned from the same call to `cellranger mkfastq`. When a `cellranger mkfastq` process attempts to write on a directory, it checks the file `<mkfastq_dir>/_lock`, where `<mkfastq_dir>` is the directory created by `cellranger mkfastq`. Ocassionally, if this file is created by other process, then the running process cannot write on the directory and returns an error. This is a concurrency error that, to the best of our knowledge, has not been solved by 10x. Since it is non-deterministic, the same command `cellranger mkfastq` can be executed with the same parameters until it finishes without errors. More information can be found [here](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/troubleshooting).
+
 ### 2. Libraries CSV
 |  FASTQs | Sample  |  Library Type |
 |---|---|---|
@@ -264,17 +295,25 @@ A single processing run will produce the following spreadsheets:
 
 ### 1. Job Meta-Data CSV
 
-| Job  | Status  | Output Path  | 
-|---|---|---|
-| mkfastq_BCL1  | Finished  | s3/path/to/zipped/fastqs  | 
-| count_FBM1  | Pending  | s3/path/to/fbm  |
+| Job  | Status  | Job Dependencies | Output Path  | 
+|---|---|---|---|
+| mkfastq_BCL1  | Finished   | - | s3/path/to/zipped/fastqs  | 
+| count_FBM1  | Pending Job  | [mkfastq_BCL1] | s3/path/to/fbm  |
 
 #### Columns
 - `Job`: the name of the job
   - `mkfastq` jobs' names will include the input BCL name
   - `count` jobs' names will include the output FBM name
   - `vdj` jobs' names will include the output TCR/BCR name
-- `Status`: current status of the job (`Pending`, `In-Progress`, `Finished`, or `Failed`)
+- `Status`: current status of the job: 
+   - `Not Submitted`: has not been submitted for running
+   - `Pending Data`: a `mkfastq` job that is waiting on `bcl` data
+   - `Pending Job`: a `count` or `vdj` job that is waiting on the completion of a dependent job (e.g. a `count` run waiting on the completion of a `mkfastq` run)
+   - `In-Progress`: a job that is currently running
+   - `Finished`: a successfully completed job
+   - `Failed`: a job that has failed (does not include informaiton on why it failed)
+   
+- `Job Dependencies`: a list of all dependent jobs (e.g. jobs that need to be completed before this job runs
 - `Output Path`: S3 path to the FASTQs, FBM, or TCR/BCR (we may drop this column when we share with researchers, but it is good for internal use)
 
 This spreadsheet shows the status of the jobs associated with a single Processing-Run. This spreadsheet serves two purposes: 
